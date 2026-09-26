@@ -3,7 +3,7 @@ import time
 import requests
 import pandas as pd
 import yfinance as yf
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -11,25 +11,53 @@ from google import genai
 from google.genai.errors import ServerError
 
 # ==========================================
-# 1. SEC 財務データ取得関数（B/S・P/L項目）
+# 0. 共通設定・SEC CIK取得
 # ==========================================
-def get_buffett_metrics(ticker: str):
-    headers = {"User-Agent": "StockAnalyzerApp user@example.com"}
+SEC_HEADERS = {"User-Agent": "StockAnalyzerApp user@example.com"}
+
+def get_cik(ticker: str):
+    """ティッカーシンボルからSEC CIKコードを取得"""
     tickers_url = "https://www.sec.gov/files/company_tickers.json"
-    res = requests.get(tickers_url, headers=headers)
+    res = requests.get(tickers_url, headers=SEC_HEADERS)
     res.raise_for_status()
-    
-    cik_str = None
     for entry in res.json().values():
         if entry["ticker"] == ticker.upper():
-            cik_str = str(entry["cik_str"]).zfill(10)
-            break
-            
-    if not cik_str:
-        return None
+            return str(entry["cik_str"]).zfill(10)
+    return None
 
+# ==========================================
+# 1. 決算発表（10-K / 10-Q 提出）判定関数
+# ==========================================
+def has_recent_earnings_filing(cik_str: str, days_threshold: int = 2) -> bool:
+    """直近指定日数以内に 10-K または 10-Q が提出されたかを判定"""
+    url = f"https://data.sec.gov/submissions/CIK{cik_str}.json"
+    res = requests.get(url, headers=SEC_HEADERS)
+    res.raise_for_status()
+    
+    recent_filings = res.json().get("filings", {}).get("recent", {})
+    forms = recent_filings.get("form", [])
+    filing_dates = recent_filings.get("filingDate", [])
+    
+    today = datetime.now(timezone.utc).date()
+    
+    for form, date_str in zip(forms, filing_dates):
+        if form in ["10-K", "10-Q"]:
+            filing_date = datetime.strptime(date_str, "%Y-%m-%d").date()
+            days_ago = (today - filing_date).days
+            if 0 <= days_ago <= days_threshold:
+                print(f"決算提出を検知: Form {form}, 提出日: {date_str} ({days_ago}日前)")
+                return True
+            else:
+                break
+    return False
+
+# ==========================================
+# 2. SEC 財務データ取得関数（B/S・P/L項目）
+# ==========================================
+def get_buffett_metrics(ticker: str, cik_str: str):
+    """SECから過去10年分の主要財務諸表データを取得結合"""
     facts_url = f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik_str}.json"
-    facts_res = requests.get(facts_url, headers=headers)
+    facts_res = requests.get(facts_url, headers=SEC_HEADERS)
     facts_res.raise_for_status()
     us_gaap = facts_res.json()["facts"].get("us-gaap", {})
 
@@ -98,12 +126,10 @@ def get_buffett_metrics(ticker: str):
     return df_combined.rename(columns=rename_dict)
 
 # ==========================================
-# 2. Gemini API レポート生成（自動リトライ＆フォールバック付き）
+# 3. Gemini API レポート生成
 # ==========================================
 def generate_analysis_report(ticker: str, df_financials: pd.DataFrame, api_key: str):
     client = genai.Client(api_key=api_key)
-    
-    # リアルタイム市場データ
     stock = yf.Ticker(ticker)
     curr_price = stock.info.get("currentPrice", stock.info.get("regularMarketPrice", "N/A"))
     shares = stock.info.get("sharesOutstanding", "N/A")
@@ -134,7 +160,7 @@ def generate_analysis_report(ticker: str, df_financials: pd.DataFrame, api_key: 
 ・財務諸表推移（過去10年）:
 {df_financials.to_string()}
 """
-    # 優先モデル順
+
     candidate_models = ["gemini-3.8-flash", "gemini-3.1-pro-preview"]
 
     for model_name in candidate_models:
@@ -153,10 +179,10 @@ def generate_analysis_report(ticker: str, df_financials: pd.DataFrame, api_key: 
                 print(f"予期しないエラー ({model_name}): {e}")
                 break
 
-    raise RuntimeError("利用可能なGeminiモデルが混雑のため応答しませんでした。")
+    raise RuntimeError("利用可能なGeminiモデルが応答しませんでした。")
 
 # ==========================================
-# 3. メール送信関数
+# 4. メール送信関数
 # ==========================================
 def send_email(subject, body, sender_email, sender_password, receiver_email):
     msg = MIMEMultipart()
@@ -172,27 +198,40 @@ def send_email(subject, body, sender_email, sender_password, receiver_email):
     server.quit()
 
 # ==========================================
-# 4. メイン処理（実行エントリーポイント）
+# 5. メイン処理（保有7銘柄の決算判定）
 # ==========================================
 def main():
     api_key = os.environ.get("GEMINI_API_KEY")
     sender_email = os.environ.get("GMAIL_ADDRESS")
     sender_pwd = os.environ.get("GMAIL_APP_PASSWORD")
 
-    TARGET_TICKERS = ["INTU"]
+    # 保有7銘柄
+    TARGET_TICKERS = ["BR", "CDNS", "CPRT", "GOOGL", "INTU", "NVDA", "ZTS"]
 
     for ticker in TARGET_TICKERS:
-        print(f"--- {ticker} の分析を開始 ---")
-        df_fin = get_buffett_metrics(ticker)
+        print(f"\n==========================================")
+        print(f"[{ticker}] 決算発表状況を確認中...")
+        
+        cik_str = get_cik(ticker)
+        if not cik_str:
+            print(f"{ticker}: CIKコードの取得に失敗しました。")
+            continue
+            
+        # 直近2日以内に 10-K または 10-Q の開示があるか判定
+        if not has_recent_earnings_filing(cik_str, days_threshold=2):
+            print(f"{ticker}: 直近2日以内の決算開示（10-K/10-Q）はありません。スキップします。")
+            continue
+
+        print(f"{ticker}: 新しい決算開示を確認しました。分析レポートを作成します。")
+        df_fin = get_buffett_metrics(ticker, cik_str)
         if df_fin is None or df_fin.empty:
-            print(f"{ticker}: 財務データが取得できませんでした。")
+            print(f"{ticker}: 財務データの取得に失敗しました。")
             continue
             
         report = generate_analysis_report(ticker, df_fin, api_key)
-        
-        subject = f"【自動決算診断】{ticker} 企業価値・バリュー投資レポート ({datetime.now(timezone.utc).strftime('%Y/%m/%d')})"
+        subject = f"【決算速報診断】{ticker} 企業価値・バリュー投資レポート ({datetime.now(timezone.utc).strftime('%Y/%m/%d')})"
         send_email(subject, report, sender_email, sender_pwd, sender_email)
-        print(f"{ticker} のメール送信が完了しました。")
+        print(f"{ticker} のレポート送信が完了しました。")
 
 if __name__ == "__main__":
     main()
