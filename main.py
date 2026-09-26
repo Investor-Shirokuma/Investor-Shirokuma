@@ -133,7 +133,7 @@ def generate_analysis_report(ticker: str, df_financials: pd.DataFrame, api_key: 
 {df_financials.to_string()}
 """
     response = client.models.generate_content(
-        model='gemini-2.5-flash',
+        model='gemini-3.8-flash',
         contents=prompt
     )
     return response.text
