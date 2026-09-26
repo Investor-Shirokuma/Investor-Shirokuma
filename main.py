@@ -1,4 +1,5 @@
 import os
+import time
 import requests
 import pandas as pd
 import yfinance as yf
@@ -7,6 +8,7 @@ import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from google import genai
+from google.genai.errors import ServerError
 
 # ==========================================
 # 1. SEC 財務データ取得関数（B/S・P/L項目）
@@ -96,7 +98,7 @@ def get_buffett_metrics(ticker: str):
     return df_combined.rename(columns=rename_dict)
 
 # ==========================================
-# 2. Gemini API レポート生成
+# 2. Gemini API レポート生成（自動リトライ＆フォールバック付き）
 # ==========================================
 def generate_analysis_report(ticker: str, df_financials: pd.DataFrame, api_key: str):
     client = genai.Client(api_key=api_key)
@@ -132,11 +134,26 @@ def generate_analysis_report(ticker: str, df_financials: pd.DataFrame, api_key: 
 ・財務諸表推移（過去10年）:
 {df_financials.to_string()}
 """
-    response = client.models.generate_content(
-        model="gemini-3.8-flash",
-        contents=prompt
-    )
-    return response.text
+    # 優先モデル順
+    candidate_models = ["gemini-2.5-flash", "gemini-2.5-pro"]
+
+    for model_name in candidate_models:
+        for attempt in range(3):
+            try:
+                print(f"[{model_name}] レポート生成を試行中 (試行回数: {attempt + 1})...")
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=prompt
+                )
+                return response.text
+            except ServerError as e:
+                print(f"503 混雑エラー検知: {e}. 10秒待機して再試行します...")
+                time.sleep(10)
+            except Exception as e:
+                print(f"予期しないエラー ({model_name}): {e}")
+                break
+
+    raise RuntimeError("利用可能なGeminiモデルが混雑のため応答しませんでした。")
 
 # ==========================================
 # 3. メール送信関数
