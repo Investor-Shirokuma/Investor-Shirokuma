@@ -133,7 +133,7 @@ def generate_analysis_report(ticker: str, df_financials: pd.DataFrame, api_key: 
 {df_financials.to_string()}
 """
     response = client.models.generate_content(
-        model='gemini-3.8-flash',
+        model="gemini-2.5-flash",
         contents=prompt
     )
     return response.text
@@ -162,8 +162,7 @@ def main():
     sender_email = os.environ.get("GMAIL_ADDRESS")
     sender_pwd = os.environ.get("GMAIL_APP_PASSWORD")
 
-    # 監視対象銘柄
-    TARGET_TICKERS = ["INTU","GOOGL","NVDA","BR","ZTS","CPRT","CDNS"]
+    TARGET_TICKERS = ["INTU"]
 
     for ticker in TARGET_TICKERS:
         print(f"--- {ticker} の分析を開始 ---")
