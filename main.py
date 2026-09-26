@@ -135,7 +135,7 @@ def generate_analysis_report(ticker: str, df_financials: pd.DataFrame, api_key: 
 {df_financials.to_string()}
 """
     # 優先モデル順
-    candidate_models = ["gemini-3.8-flash", "gemini-3.1-pro-preview""]
+    candidate_models = ["gemini-3.8-flash", "gemini-3.1-pro-preview"]
 
     for model_name in candidate_models:
         for attempt in range(3):
