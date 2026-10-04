@@ -3,12 +3,12 @@ import time
 import requests
 import pandas as pd
 import yfinance as yf
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from google import genai
-from google.genai.errors import ServerError
+from google.genai.errors import ServerError, ClientError
 
 # ==========================================
 # 0. 共通設定・SEC CIK取得
@@ -55,7 +55,6 @@ def has_recent_earnings_filing(cik_str: str, days_threshold: int = 2) -> bool:
 # 2. SEC 財務データ取得関数（B/S・P/L項目）
 # ==========================================
 def get_buffett_metrics(ticker: str, cik_str: str):
-    """SECから過去10年分の主要財務諸表データを取得結合"""
     facts_url = f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik_str}.json"
     facts_res = requests.get(facts_url, headers=SEC_HEADERS)
     facts_res.raise_for_status()
@@ -91,14 +90,12 @@ def get_buffett_metrics(ticker: str, cik_str: str):
             
     df_combined = df_combined.sort_values("fy").dropna(subset=["NetIncomeLoss"]).tail(10)
 
-    # 過去株式数の推計 (純利益 / EPS)
     if "EarningsPerShareDiluted" in df_combined.columns and "NetIncomeLoss" in df_combined.columns:
         df_combined["推計株式数"] = df_combined.apply(
             lambda r: r["NetIncomeLoss"] / r["EarningsPerShareDiluted"] if pd.notnull(r["EarningsPerShareDiluted"]) and r["EarningsPerShareDiluted"] != 0 else None,
             axis=1
         )
 
-    # 期末株価の取得結合
     try:
         stock = yf.Ticker(ticker)
         hist = stock.history(period="10y", interval="1mo")
@@ -126,7 +123,7 @@ def get_buffett_metrics(ticker: str, cik_str: str):
     return df_combined.rename(columns=rename_dict)
 
 # ==========================================
-# 3. Gemini API レポート生成
+# 3. Gemini API レポート生成（レートリミット対策付き）
 # ==========================================
 def generate_analysis_report(ticker: str, df_financials: pd.DataFrame, api_key: str):
     client = genai.Client(api_key=api_key)
@@ -164,7 +161,7 @@ def generate_analysis_report(ticker: str, df_financials: pd.DataFrame, api_key: 
     candidate_models = ["gemini-3.8-flash", "gemini-3.1-pro-preview"]
 
     for model_name in candidate_models:
-        for attempt in range(3):
+        for attempt in range(4):
             try:
                 print(f"[{model_name}] レポート生成を試行中 (試行回数: {attempt + 1})...")
                 response = client.models.generate_content(
@@ -172,14 +169,21 @@ def generate_analysis_report(ticker: str, df_financials: pd.DataFrame, api_key: 
                     contents=prompt
                 )
                 return response.text
-            except ServerError as e:
-                print(f"503 混雑エラー検知: {e}. 10秒待機して再試行します...")
-                time.sleep(10)
+            except (ServerError, ClientError) as e:
+                err_str = str(e)
+                # 429（頻度制限超過）または 503（一時的混雑）の場合は待機して再試行
+                if "429" in err_str or "503" in err_str or "RESOURCE_EXHAUSTED" in err_str:
+                    wait_time = 15 * (attempt + 1)
+                    print(f"API頻度/混雑制限を検知。{wait_time}秒待機して再試行します...")
+                    time.sleep(wait_time)
+                else:
+                    print(f"予期しないエラー ({model_name}): {e}")
+                    break
             except Exception as e:
-                print(f"予期しないエラー ({model_name}): {e}")
+                print(f"一般エラー ({model_name}): {e}")
                 break
 
-    raise RuntimeError("利用可能なGeminiモデルが応答しませんでした。")
+    raise RuntimeError("利用可能なGeminiモデルが頻度制限または混雑のため応答しませんでした。")
 
 # ==========================================
 # 4. メール送信関数
@@ -198,7 +202,7 @@ def send_email(subject, body, sender_email, sender_password, receiver_email):
     server.quit()
 
 # ==========================================
-# 5. メイン処理（保有7銘柄の決算判定）
+# 5. メイン処理（保有7銘柄）
 # ==========================================
 def main():
     api_key = os.environ.get("GEMINI_API_KEY")
@@ -232,6 +236,9 @@ def main():
         subject = f"【決算速報診断】{ticker} 企業価値・バリュー投資レポート ({datetime.now(timezone.utc).strftime('%Y/%m/%d')})"
         send_email(subject, report, sender_email, sender_pwd, sender_email)
         print(f"{ticker} のレポート送信が完了しました。")
+
+        # 連続実行時の無料枠制限対策として待機を挟む
+        time.sleep(10)
 
 if __name__ == "__main__":
     main()
